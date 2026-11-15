@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use serde::Serialize;
 use tokio::select;
+use rfd::FileDialog;
 use crate::async_counter_stream::{ByteCounterReadStream, ByteCounterWriteStream};
 use crate::encoder_decoder::Decoder;
 #[derive(Serialize)]
@@ -43,7 +44,7 @@ async fn compress_file(input_path: String, output_path: String, on_progress: tau
     let progress_handler_for_watcher = progress_handler.clone();
     // initialize the encoder
     // `Encoder::open` returns None for empty input; treat that as an error.
-    let Some(mut encoder) = encoder_decoder::Encoder::open(text, writer) else{
+    let Some(encoder) = encoder_decoder::Encoder::open(text, writer) else{
         return Err("Error: input file is empty".to_string());
     };
     let expected_output_total_byte_num = encoder.get_total_byte_size();
@@ -92,7 +93,7 @@ async fn decompress_file(input_path: String, output_path: String, on_progress: t
     let reader = ByteCounterReadStream::new(BufReader::new(input_file));
     // get the handle (Arc<AtomicUsize>) to fetch the num of encoded byte
     let progress_handler = reader.get_handle();
-    let mut decoder = Decoder::open(reader);
+    let decoder = Decoder::open(reader);
     let decoding_task = tokio::task::spawn_blocking (move || async move {
         decoder.decode().map_err(|e| e.to_string())
     });
@@ -124,12 +125,27 @@ async fn decompress_file(input_path: String, output_path: String, on_progress: t
         elapsed_ms,
     })
 }
+#[tauri::command]
+async fn pick_output_path(expected_file_name: String) -> Result<Option<String>, String>{
+    let extension= match expected_file_name.rsplit_once('.'){
+        Some((_, ext)) => ext,
+        None => ""
+    };
+    println!("Picking output file: {}", expected_file_name);
+    let Some(path_buf) =  FileDialog::new().set_file_name(&expected_file_name).add_filter("File Name", &[extension])
+        .save_file() else{
+        return Ok(None);
+    };
+    let Some(path_str) = path_buf.to_str() else{
+        return Err("Error: selected file name contains invalid UTF-8 characters".to_string());
+    };
+    Ok(Some(String::from(path_str)))
+}
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    println!("{}",size_of::<encoder_decoder::DecodeEntry>());
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![compress_file, decompress_file])
+        .invoke_handler(tauri::generate_handler![compress_file, decompress_file, pick_output_path])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
