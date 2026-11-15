@@ -203,22 +203,22 @@ impl<R : Read> Decoder<R> {
         }
         Ok(codes)
     }
-    fn build_tree_table(chars:Vec<char>, codes:Vec<BinaryCode>, max_huffman_depth:u8) -> Box<[DecodeEntry]>{
+    fn build_tree_table(chars:Vec<char>, codes:Vec<BinaryCode>, table_depth:u8) -> Box<[DecodeEntry]>{
         // Look-up Table Structure
         // Aims to achieve nearly O(1) lookup complexity
         // 1. Short codes: expanded and stored directly as DecodeEntry
         // 2. Long  codes: choose between two strategies ro balance memory and speed
         //  -Subtable: mirrors the supertable structure; memory-intensive nut O(1)
         //  -Linear table: scan-based lookup; memory-effective but degrades to O(n)
-        let mut vec_table = Vec::with_capacity(1usize << max_huffman_depth);
+        let mut vec_table = Vec::with_capacity(1usize << table_depth);
         let mut i = 0;
         let n = codes.len(); // chars.len() == codes.len()
         while i < n{
             let len  = codes[i].len ;
             let character = chars[i];
-            if len <= max_huffman_depth {
+            if len <= table_depth {
                 // short codes are expanded to fill all `2^(MAX - len)` table slots sharing that prefix.
-                for _ in 0..1usize << (max_huffman_depth - len) {
+                for _ in 0..1usize << (table_depth - len) {
                     let entry = DecodeEntry::Direct{ character, len};
                     // `chars` and `codes` are provided in Huffman-tree preorder, so the code
                     // intervals are disjoint and strictly increasing; pushing in this order
@@ -231,17 +231,17 @@ impl<R : Read> Decoder<R> {
                 let mut deep_code_map_char = Vec::<char>::new();
                 let mut deep_code_map_binary = Vec::<BinaryCode>::new();
                 // codes[i] (type:BinaryCode).binary : LSB-aligned
-                let prefix = codes[i].binary >> (len - max_huffman_depth);
+                let prefix = codes[i].binary >> (len - table_depth);
                 // cnt : number of deep codes sharing same prefix.
                 // determine whether to use subtable or linear table storage.
                 let mut deep_code_num = 0;
                 let mut max_suffix_len = 0;
                 while i < n{
                     // 1. Stop if we encounter a short code (start of a new subtree).
-                    if codes[i].len <= max_huffman_depth{
+                    if codes[i].len <= table_depth {
                         break;
                     }
-                    let suffix_len = codes[i].len - max_huffman_depth;
+                    let suffix_len = codes[i].len - table_depth;
                     let code = codes[i].binary;
                     // 2. Stop if the prefix changes.
                     if (code >> suffix_len) != prefix {
@@ -267,40 +267,37 @@ impl<R : Read> Decoder<R> {
                 }
                 else{
                     // Dense leaves and manageable span: use a subtable to achieve O(1) lookup time.
-                    DecodeEntry::SubTable{
-                        subtable: Self::build_tree_table(deep_code_map_char, deep_code_map_binary, max_suffix_len),
-                        depth: max_huffman_depth,
-                    }
+                    DecodeEntry::SubTable(Self::build_tree_table(deep_code_map_char, deep_code_map_binary, max_suffix_len))
                 };
                 vec_table.push(stored);
             }
         }
         // Guarantee the table is fully populated.
-        debug_assert_eq!(vec_table.len(), 1usize << max_huffman_depth);
+        debug_assert_eq!(vec_table.len(), 1usize << table_depth);
         vec_table.into_boxed_slice()
     }
     pub fn read_huffman_code_from_table(table: &Box<[DecodeEntry]>, scan: u32) -> Result<(char, u8), io::Error>{
         //return : the char and the len of then DecodeEntry
         // the table size must be the power of 2
-        let depth = table.len().trailing_zeros() as usize;
-        let idx = (scan >> (32 - depth)) as usize;
-        let next_scan = scan << depth;
+        let supertable_depth = table.len().trailing_zeros() as u8;
+        let idx = (scan >> (32 - supertable_depth)) as usize;
+        let next_scan = scan << supertable_depth;
         match &table[idx] {
             DecodeEntry::Direct { character, len } => {Ok((*character, *len ))}
             DecodeEntry::SubVec(vec) => {
-                
+
                 for(character, binary_code) in vec{
                     let suffix = next_scan >> (32 - binary_code.len);
                     if suffix == binary_code.binary{
-                        return Ok((*character, binary_code.len + depth as u8));
+                        return Ok((*character, binary_code.len + supertable_depth));
                     }
                 }
                 unreachable!("The suffix must be in the linear table");
             }
-            DecodeEntry::SubTable {subtable, depth } => {
-                let next_scan = scan << depth;
-                let (character, sub_depth) = Self::read_huffman_code_from_table(subtable, next_scan)?;
-                Ok((character, sub_depth + *depth))
+            DecodeEntry::SubTable (subtable) => {
+                let next_scan = scan << supertable_depth;
+                let (character, subtable_depth) = Self::read_huffman_code_from_table(subtable, next_scan)?;
+                Ok((character, subtable_depth + supertable_depth))
             }
         }
 
@@ -557,8 +554,5 @@ pub enum DecodeEntry{
         len :u8,
     },
     SubVec(Vec<(char,BinaryCode)>),
-    SubTable{
-        subtable:Box<[DecodeEntry]>,
-        depth: u8
-    },
+    SubTable(Box<[DecodeEntry]>),
 }

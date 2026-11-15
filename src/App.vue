@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import pickIcon from "./assets/icon.svg";
 import {
+  PICK_OUTPUT_PATH_COMMAND,
   commandName,
   isTauriRuntime,
+  pickOutputPath,
   runOperation,
   type Mode,
   type OperationReport,
@@ -13,17 +16,23 @@ type Status = "idle" | "running" | "done" | "error";
 
 const mode = ref<Mode>("compress");
 const inputPath = ref("");
+const outputPath = ref("");
 const status = ref<Status>("idle");
 const progress = ref(0);
 const report = ref<OperationReport | null>(null);
 const errorText = ref("");
+const pickerError = ref("");
 const dragging = ref(false);
+const isPicking = ref(false);
 const inputEl = ref<HTMLInputElement | null>(null);
 const isTauri = isTauriRuntime();
 
 const isRunning = computed(() => status.value === "running");
 const canRun = computed(
-  () => inputPath.value.trim().length > 0 && !isRunning.value,
+  () =>
+    inputPath.value.trim().length > 0 &&
+    outputPath.value.trim().length > 0 &&
+    !isRunning.value,
 );
 const actionLabel = computed(() =>
   mode.value === "compress" ? "压缩" : "解压",
@@ -38,8 +47,11 @@ const subline = computed(() =>
 );
 const fileName = computed(() => baseName(inputPath.value.trim()));
 const fileExt = computed(() => extensionOf(fileName.value));
-const outputPath = computed(() =>
-  deriveOutputPath(inputPath.value.trim(), mode.value),
+const outputFileExt = computed(() =>
+  extensionOf(baseName(outputPath.value.trim())),
+);
+const expectedOutputName = computed(() =>
+  baseName(defaultOutputPath(inputPath.value, mode.value)),
 );
 const inputLabel = computed(() =>
   mode.value === "compress" ? "原始" : "压缩包",
@@ -81,11 +93,33 @@ function extensionOf(name: string): string {
   return name.slice(dot + 1, dot + 5).toUpperCase();
 }
 
-function deriveOutputPath(path: string, currentMode: Mode): string {
-  if (!path) return "";
-  if (currentMode === "compress") return `${path}.huff`;
-  return /\.huff$/i.test(path) ? path.replace(/\.huff$/i, "") : `${path}.out`;
+function replaceExtension(path: string, extension: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) return "";
+  const separator = Math.max(
+    trimmed.lastIndexOf("\\"),
+    trimmed.lastIndexOf("/"),
+  );
+  const directory = trimmed.slice(0, separator + 1);
+  const name = trimmed.slice(separator + 1);
+  // 只去掉文件名最后一个点及其后的后缀，目录名里的点保持不变
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  return `${directory}${stem}.${extension}`;
 }
+
+function defaultOutputPath(path: string, currentMode: Mode): string {
+  return replaceExtension(path, currentMode === "compress" ? "huff" : "txt");
+}
+
+watch(
+  inputPath,
+  (path) => {
+    outputPath.value = defaultOutputPath(path, mode.value);
+    pickerError.value = "";
+  },
+  { flush: "sync" },
+);
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "—";
@@ -127,26 +161,65 @@ function focusInput(): void {
 function setMode(next: Mode): void {
   if (isRunning.value || next === mode.value) return;
   mode.value = next;
+  outputPath.value = defaultOutputPath(inputPath.value, next);
+  pickerError.value = "";
   resetOutcome();
 }
 
 function acceptPath(path: string): void {
   if (isRunning.value) return;
   inputPath.value = path;
+  outputPath.value = defaultOutputPath(path, mode.value);
   resetOutcome();
 }
 
 function clearFile(): void {
   if (isRunning.value) return;
   inputPath.value = "";
+  outputPath.value = "";
   resetOutcome();
   focusInput();
 }
 
-function describeError(error: unknown): string {
+function onOutputInput(): void {
+  pickerError.value = "";
+  resetOutcome();
+}
+
+async function chooseOutputPath(): Promise<void> {
+  if (isRunning.value || isPicking.value) return;
+  const expectedName = expectedOutputName.value;
+  if (!expectedName) {
+    pickerError.value = "请先选择输入文件，再选择输出路径。";
+    return;
+  }
+  if (!isTauri) {
+    pickerError.value =
+      "浏览器预览无法打开文件选择器，请用 pnpm tauri dev 打开桌面窗口。";
+    return;
+  }
+
+  pickerError.value = "";
+  isPicking.value = true;
+  try {
+    const picked = await pickOutputPath(expectedName);
+    if (!picked) return;
+    outputPath.value = picked;
+    resetOutcome();
+  } catch (error) {
+    pickerError.value = describeError(error, PICK_OUTPUT_PATH_COMMAND);
+  } finally {
+    isPicking.value = false;
+  }
+}
+
+function describeError(
+  error: unknown,
+  command = commandName(mode.value),
+): string {
   const message = error instanceof Error ? error.message : String(error ?? "");
   if (/not found/i.test(message)) {
-    return `命令 ${commandName(mode.value)} 尚未注册。实现后记得加入 generate_handler!。`;
+    return `命令 ${command} 尚未注册。实现后记得加入 generate_handler!。`;
   }
   if (/not allowed|permission/i.test(message)) {
     return `权限不足：${message}。自定义命令一般不需要 capability，请检查是否调用了受权限保护的插件 API。`;
@@ -170,7 +243,7 @@ async function run(): Promise<void> {
   try {
     report.value = await runOperation(mode.value, {
       inputPath: inputPath.value.trim(),
-      outputPath: outputPath.value,
+      outputPath: outputPath.value.trim(),
       onProgress: (percent) => {
         progress.value = clampPercent(percent);
       },
@@ -343,9 +416,48 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <p class="output">
-          <span>输出</span>
-          <code :title="outputPath">{{ outputPath || "—" }}</code>
+      </section>
+
+      <section class="field" aria-labelledby="output-label">
+        <div class="field-head">
+          <span id="output-label">输出文件</span>
+          <span class="field-hint">自动生成，可修改或点击左侧选择</span>
+        </div>
+
+        <div
+          class="file-field output-field"
+          :class="{ filled: !!outputPath }"
+        >
+          <button
+            type="button"
+            class="pick"
+            :disabled="isRunning || isPicking || !expectedOutputName"
+            :aria-busy="isPicking"
+            :aria-label="expectedOutputName ? '选择输出路径' : '请先选择输入文件'"
+            :title="expectedOutputName ? '选择输出路径' : '请先选择输入文件'"
+            @click="chooseOutputPath"
+          >
+            <img :src="pickIcon" alt="" aria-hidden="true" />
+          </button>
+
+          <input
+            id="output-path"
+            v-model="outputPath"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            aria-label="输出文件路径"
+            placeholder="选择文件"
+            :disabled="isRunning"
+            @input="onOutputInput"
+            @keydown.enter="run"
+          />
+
+          <span v-if="outputPath" class="ext">{{ outputFileExt }}</span>
+        </div>
+
+        <p v-if="pickerError" class="field-error" role="alert">
+          {{ pickerError }}
         </p>
       </section>
 
@@ -488,7 +600,7 @@ onUnmounted(() => {
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.03);
   color: var(--muted);
-  font-family: var(--mono);
+  font-family: inherit;
   font-size: 11px;
 }
 
@@ -533,7 +645,7 @@ onUnmounted(() => {
 }
 
 .notice code {
-  font-family: var(--mono);
+  font-family: inherit;
   font-size: 11.5px;
   color: #f6d58b;
 }
@@ -609,6 +721,10 @@ onUnmounted(() => {
   color: var(--faint);
 }
 
+.field + .field {
+  margin-top: 16px;
+}
+
 .file-field {
   display: flex;
   align-items: center;
@@ -677,7 +793,7 @@ onUnmounted(() => {
   outline: 0;
   background: none;
   color: var(--text);
-  font-family: var(--mono);
+  font-family: inherit;
   font-size: 12.5px;
   letter-spacing: 0.1px;
 }
@@ -696,7 +812,7 @@ onUnmounted(() => {
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   color: var(--muted);
-  font-family: var(--mono);
+  font-family: inherit;
   font-size: 10px;
   letter-spacing: 0.6px;
 }
@@ -732,24 +848,82 @@ onUnmounted(() => {
   opacity: 0.5;
 }
 
-.output {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  margin: 9px 2px 0;
-  min-height: 17px;
-  font-size: 11.5px;
-  color: var(--faint);
+.pick {
+  position: relative;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease,
+    transform 0.15s ease,
+    opacity 0.2s ease;
 }
 
-.output code {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--mono);
+/* 暗色底下的高亮渐变，只在 hover 时淡入 */
+.pick::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(135deg, #6ee7d8, #7dd3fc);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+}
+
+.pick img {
+  position: relative;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+  pointer-events: none;
+  filter: brightness(0) invert(1);
+  opacity: 0.45;
+  transition: opacity 0.2s ease;
+}
+
+.pick:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.32);
+  box-shadow:
+    0 8px 18px -10px rgba(94, 234, 212, 0.9),
+    inset 0 1px 0 rgba(255, 255, 255, 0.4);
+}
+
+.pick:hover:not(:disabled)::before {
+  opacity: 1;
+}
+
+.pick:hover:not(:disabled) img {
+  opacity: 0.95;
+}
+
+.pick:active:not(:disabled) {
+  transform: translateY(0) scale(0.97);
+}
+
+.pick:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.field-error {
+  margin: 8px 2px 0;
+  color: #fca5a5;
   font-size: 11.5px;
-  color: #9fb0c3;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .primary {
@@ -819,7 +993,7 @@ onUnmounted(() => {
 }
 
 .mono {
-  font-family: var(--mono);
+  font-family: inherit;
   font-variant-numeric: tabular-nums;
 }
 
@@ -957,7 +1131,8 @@ onUnmounted(() => {
 
 .primary:focus-visible,
 .mode-switch button:focus-visible,
-.clear:focus-visible {
+.clear:focus-visible,
+.pick:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
